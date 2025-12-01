@@ -1,11 +1,16 @@
 # AIperf Benchmark Playbook
 
-This folder holds the four benchmark runs (aggregation vs disaggregation+router, workloads A and B) for Qwen/Qwen3-0.6B using NVIDIA Dynamo.
+This folder holds the four benchmark runs (aggregation vs disaggregation+router, workloads A and B) for Qwen/Qwen3-0.6B using NVIDIA Dynamo. Runs can target either a vLLM-based router or a TRT-LLM-based router; pick the right port forward before starting disaggregation+router tests (see below).
 
 ## Shared flags (use in every run)
 ```
 --model Qwen/Qwen3-0.6B --url http://localhost:8000 --endpoint-type chat --endpoint /v1/chat/completions --streaming --warmup-request-count 40 --extra-inputs ignore_eos:true
 ```
+
+## Backend and port forwarding (disaggregation+router)
+Keep port 8000 forwarded to the router frontend that matches the inference backend you are testing:
+- **vLLM backend:** `kubectl port-forward service/llm-disagg-router-frontend-app 8000:8000 -n dynamo-cloud`
+- **TRT-LLM backend:** `kubectl port-forward service/trtllm-disagg-router-frontend-app 8000:8000 -n dynamo-cloud`
 
 ## Workloads
 - **Workload A (prefill-heavy, short decode):** highlights whether prefill disaggregation helps  
@@ -20,11 +25,14 @@ This folder holds the four benchmark runs (aggregation vs disaggregation+router,
 ## Procedure
 1. Start backend in **Aggregation** mode and warm it.
 2. Run Workload A, then Workload B. Record tokens/s, TTFT, p95/p99.
-3. Switch backend to **Disaggregation + Router** (same model/config).
+3. Switch backend to **Disaggregation + Router** (same model/config) and ensure the matching port forward above is running.
 4. Rerun Workload A and Workload B.
-5. Compare metrics. Expect clearer gains in Workload B (decode-heavy) and potential wins in Workload A if prefill splitting reduces queuing.
-
-Optional: if the client supports open-loop arrivals, enable it to avoid closed-loop backpressure masking backend differences.
+5. Move all the generated folders and files from artifacts to artifacts_benchmark
+6. Compare metrics. Expect clearer gains in Workload B (decode-heavy) and potential wins in Workload A if prefill splitting reduces queuing.
+    ```
+    python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm
+    python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm
+    ```
 
 ## Plotting
 Generate the two-panel throughput + TTFT chart (Workload A and B) from the four runs:

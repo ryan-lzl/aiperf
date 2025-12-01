@@ -1,23 +1,15 @@
-"""
-Plot output token throughput for four benchmark scenarios under artifacts_benchmark.
-Outputs a two-panel bar chart image: artifacts_benchmark/output_token_throughput.png
+"""Plot output token throughput for four benchmark scenarios under artifacts_benchmark.
+Outputs a two-panel bar chart image: artifacts_benchmark/output_token_throughput_<model>_<backend>.png
 """
 
+import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-
-MODEL_NAME = "Qwen/Qwen3-0.6B"
-
-SCENARIOS = [
-    ("Agg", "A", "Qwen_Qwen3-0.6B-agg-vllm-workload-A/profile_export_aiperf.json"),
-    ("Disagg + Router", "A", "Qwen_Qwen3-0.6B-disagg-router-vllm-workload-A/profile_export_aiperf.json"),
-    ("Agg", "B", "Qwen_Qwen3-0.6B-agg-vllm-workload-B/profile_export_aiperf.json"),
-    ("Disagg + Router", "B", "Qwen_Qwen3-0.6B-disagg-router-vllm-workload-B/profile_export_aiperf.json"),
-]
 
 WORKLOAD_DESCRIPTIONS = {
     "A": "Workload A (prefill-heavy): input ~900 tokens, output ~160 tokens; useful to see prefill disaggregation effects.",
@@ -64,14 +56,72 @@ def infer_backend_label(rel_path: str) -> str:
     return dir_name
 
 
+def normalize_backend_flag(raw: str) -> tuple[str, str]:
+    key = raw.strip().lower().replace("_", "-")
+    mapping = {
+        "vllm": ("vLLM", "vllm"),
+        "trt": ("TensorRT-LLM", "trtllm"),
+        "trt-llm": ("TensorRT-LLM", "trtllm"),
+        "trtllm": ("TensorRT-LLM", "trtllm"),
+        "tensorrt": ("TensorRT-LLM", "trtllm"),
+    }
+    if key in mapping:
+        return mapping[key]
+    raise ValueError(f"Unsupported backend '{raw}'. Expected one of: vllm, trtllm.")
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"[^a-z0-9-]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text or "value"
+
+
+def model_to_path_token(model: str) -> str:
+    token = model.strip()
+    token = token.replace("/", "_")
+    token = re.sub(r"\s+", "_", token)
+    # Keep dots for model versioning (e.g., 0.6B) to match folder names.
+    token = re.sub(r"[^A-Za-z0-9_.-]", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or "model"
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Plot throughput and TTFT for aggregation vs disaggregation+router runs.")
+    parser.add_argument("--model", required=True, help="Model name to annotate in the chart title.")
+    parser.add_argument(
+        "--inference-backend",
+        dest="inference_backend",
+        required=True,
+        help="Inference backend label to annotate in the chart title (e.g., vLLM, TensorRT-LLM).",
+    )
+    args = parser.parse_args()
+
+    model_name = args.model
+    try:
+        backend_label, backend_path_token = normalize_backend_flag(args.inference_backend)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    model_path_token = model_to_path_token(model_name)
+    scenarios = [
+        ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A/profile_export_aiperf.json"),
+        ("Disagg + Router", "A", f"{model_path_token}-disagg-router-{backend_path_token}-workload-A/profile_export_aiperf.json"),
+        ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B/profile_export_aiperf.json"),
+        ("Disagg + Router", "B", f"{model_path_token}-disagg-router-{backend_path_token}-workload-B/profile_export_aiperf.json"),
+    ]
     base_dir = Path(__file__).resolve().parent
     results = []
-    for label, workload_key, rel_path in SCENARIOS:
+    for label, workload_key, rel_path in scenarios:
         throughput, ttft_ms, has_errors, full_path = load_throughput(base_dir, rel_path)
         results.append((label, workload_key, throughput, ttft_ms, has_errors, full_path))
 
-    backend_label = infer_backend_label(SCENARIOS[0][2]) if SCENARIOS else "Backend"
+    inferred_backend = infer_backend_label(scenarios[0][2]) if scenarios else "Backend"
+    if backend_label != inferred_backend:
+        print(f"Note: using backend from flag ({backend_label}); inferred backend from paths is {inferred_backend}.")
 
     # Prepare plot data grouped by workload
     workload_to_entries = {"A": [], "B": []}
@@ -79,7 +129,7 @@ def main():
         workload_to_entries[workload_key].append((label, throughput, ttft_ms, has_errors, full_path))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6.5))
-    fig.suptitle(f"{MODEL_NAME} on {backend_label} with Dynamo - Throughput & TTFT (Time to First Token)", fontsize=14)
+    fig.suptitle(f"{model_name} on {backend_label} with Dynamo - Throughput & TTFT (Time to First Token)", fontsize=14)
 
     throughput_color = "#4C78A8"
     ttft_color = "#F58518"
@@ -167,13 +217,16 @@ def main():
     plot_workload(axes[1], "B", workload_to_entries["B"])
 
     # Add workload explanations below the plots, left-aligned with numbering
-    fig.text(0.02, 0.09, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.06, f"2) {WORKLOAD_DESCRIPTIONS['B']}", ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.03, "3) Disagg + Router mode uses 2 prefill worker nodes and 2 decode worker nodes.", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.11, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.08, f"2) {WORKLOAD_DESCRIPTIONS['B']}", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.05, "3) Disagg + Router mode uses 2 prefill worker nodes and 2 decode worker nodes; each worker node requires 1 GPU.", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.02, "4) Agg mode uses 4 worker nodes and round-robin for load balancing; each worker node requires 1 GPU.", ha="left", fontsize=9, wrap=True)
 
-    fig.tight_layout(rect=(0, 0.12, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.18, 1, 0.93))
 
-    out_path = base_dir / "output_token_throughput.png"
+    slug_model = slugify(model_name)
+    slug_backend = slugify(backend_label)
+    out_path = base_dir / f"output_token_throughput_{slug_model}_{slug_backend}.png"
     fig.savefig(out_path, dpi=150)
 
     print("Output Token Throughput (tokens/sec) and TTFT (ms)")
