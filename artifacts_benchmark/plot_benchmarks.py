@@ -88,6 +88,34 @@ def model_to_path_token(model: str) -> str:
     return token or "model"
 
 
+def find_disagg_dir(base_dir: Path, model_token: str, backend_token: str, workload_key: str) -> str:
+    """Find a single disagg directory with worker-balancing suffix (e.g., ...-3P-1D)."""
+    prefix = f"{model_token}-disagg-router-{backend_token}-workload-{workload_key}-"
+    candidates = []
+    pattern = re.compile(rf"^{re.escape(prefix)}\d+P-\d+D$")
+    for entry in base_dir.iterdir():
+        if entry.is_dir() and pattern.match(entry.name):
+            profile = entry / "profile_export_aiperf.json"
+            if profile.is_file():
+                candidates.append(entry)
+    if not candidates:
+        raise FileNotFoundError(
+            f"No disagg directory found for workload {workload_key} with prefix '{prefix}<n>P-<m>D' containing profile_export_aiperf.json."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(e.name for e in candidates)
+        raise ValueError(f"Multiple disagg directories match {prefix}*: {names}.")
+    return candidates[0].name
+
+
+def parse_worker_counts(dir_name: str) -> tuple[int | None, int | None]:
+    """Extract prefill/decode counts from a suffix like -3P-1D; returns (prefill, decode)."""
+    match = re.search(r"-(\d+)P-(\d+)D$", dir_name)
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot throughput and TTFT for aggregation vs disaggregation+router runs.")
     parser.add_argument("--model", required=True, help="Model name to annotate in the chart title.")
@@ -96,6 +124,11 @@ def main():
         dest="inference_backend",
         required=True,
         help="Inference backend label to annotate in the chart title (e.g., vLLM, TensorRT-LLM).",
+    )
+    parser.add_argument(
+        "--worker-balancing",
+        action="store_true",
+        help="Enable to use disagg folders with explicit prefill/decode worker counts in their names (e.g., ...-3P-1D).",
     )
     args = parser.parse_args()
 
@@ -107,13 +140,25 @@ def main():
         sys.exit(1)
 
     model_path_token = model_to_path_token(model_name)
+    base_dir = Path(__file__).resolve().parent
+
+    if args.worker_balancing:
+        try:
+            disagg_dir_a = find_disagg_dir(base_dir, model_path_token, backend_path_token, "A")
+            disagg_dir_b = find_disagg_dir(base_dir, model_path_token, backend_path_token, "B")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        disagg_dir_a = f"{model_path_token}-disagg-router-{backend_path_token}-workload-A"
+        disagg_dir_b = f"{model_path_token}-disagg-router-{backend_path_token}-workload-B"
+
     scenarios = [
         ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A/profile_export_aiperf.json"),
-        ("Disagg + Router", "A", f"{model_path_token}-disagg-router-{backend_path_token}-workload-A/profile_export_aiperf.json"),
+        ("Disagg + Router", "A", f"{disagg_dir_a}/profile_export_aiperf.json"),
         ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B/profile_export_aiperf.json"),
-        ("Disagg + Router", "B", f"{model_path_token}-disagg-router-{backend_path_token}-workload-B/profile_export_aiperf.json"),
+        ("Disagg + Router", "B", f"{disagg_dir_b}/profile_export_aiperf.json"),
     ]
-    base_dir = Path(__file__).resolve().parent
     results = []
     for label, workload_key, rel_path in scenarios:
         throughput, ttft_ms, has_errors, full_path = load_throughput(base_dir, rel_path)
@@ -216,10 +261,28 @@ def main():
     plot_workload(axes[0], "A", workload_to_entries["A"])
     plot_workload(axes[1], "B", workload_to_entries["B"])
 
+    # Build footer notes
+    disagg_a_counts = parse_worker_counts(disagg_dir_a)
+    disagg_b_counts = parse_worker_counts(disagg_dir_b)
+
+    def fmt_counts(counts: tuple[int | None, int | None]) -> str:
+        prefill, decode = counts
+        if prefill is None or decode is None:
+            return "unknown prefill / decode"
+        return f"{prefill} prefill / {decode} decode"
+
+    if args.worker_balancing:
+        note3_text = (
+            f"3) Disagg + Router mode uses {fmt_counts(disagg_a_counts)} worker nodes for Workload A; "
+            f"{fmt_counts(disagg_b_counts)} for Workload B. Each worker node requires 1 GPU."
+        )
+    else:
+        note3_text = "3) Disagg + Router mode uses 2 prefill worker nodes and 2 decode worker nodes; each worker node requires 1 GPU."
+
     # Add workload explanations below the plots, left-aligned with numbering
     fig.text(0.02, 0.11, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
     fig.text(0.02, 0.08, f"2) {WORKLOAD_DESCRIPTIONS['B']}", ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.05, "3) Disagg + Router mode uses 2 prefill worker nodes and 2 decode worker nodes; each worker node requires 1 GPU.", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.05, note3_text, ha="left", fontsize=9, wrap=True)
     fig.text(0.02, 0.02, "4) Agg mode uses 4 worker nodes and round-robin for load balancing; each worker node requires 1 GPU.", ha="left", fontsize=9, wrap=True)
 
     fig.tight_layout(rect=(0, 0.18, 1, 0.93))

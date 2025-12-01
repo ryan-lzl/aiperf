@@ -30,13 +30,20 @@ Keep port 8000 forwarded to the router frontend that matches the inference backe
 5. Move all the generated folders and files from artifacts to artifacts_benchmark
 6. Compare metrics. Expect clearer gains in Workload B (decode-heavy) and potential wins in Workload A if prefill splitting reduces queuing.
     ```
-    python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm
-    python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm
+
     ```
+
+## Worker balancing flag
+If your disaggregation runs use explicit prefill/decode worker splits in the folder name (e.g., `...-workload-A-3P-1D` meaning 3 prefill workers and 1 decode worker), add `--worker-balancing` so the plotter picks up those directories. Without the flag, it uses the default `...-workload-A`/`...-workload-B` disagg folders (2 prefill + 2 decode).
 
 ## Plotting
 Generate the two-panel throughput + TTFT chart (Workload A and B) from the four runs:
 ```
-python artifacts_benchmark/plot_benchmarks.py
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm
+# Add --worker-balancing if using the ...-<n>P-<m>D disagg directories
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --worker-balancing
+
+# When using TRT-LLM as the inference backend
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm
 ```
-This saves `artifacts_benchmark/output_token_throughput.png` and prints a small table of throughput and TTFT (with WARN flags if errors were recorded).
+This saves `artifacts_benchmark/output_token_throughput_<model>_<backend>.png` and prints a small table of throughput and TTFT (with WARN flags if errors were recorded).
