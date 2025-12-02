@@ -1,5 +1,5 @@
 """Plot output token throughput for four benchmark scenarios under artifacts_benchmark.
-Outputs a two-panel bar chart image: artifacts_benchmark/output_token_throughput_<model>_<backend>.png
+Outputs a two-panel bar chart image: artifacts_benchmark/output_token_throughput_<model>_<backend>_c<concurrency>.png
 """
 
 import argparse
@@ -88,29 +88,42 @@ def model_to_path_token(model: str) -> str:
     return token or "model"
 
 
-def find_disagg_dir(base_dir: Path, model_token: str, backend_token: str, workload_key: str) -> str:
-    """Find a single disagg directory with worker-balancing suffix (e.g., ...-3P-1D)."""
+def find_disagg_dir(
+    base_dir: Path, model_token: str, backend_token: str, workload_key: str, concurrency: int, require_balanced: bool
+) -> str:
+    """Find a single disagg directory with worker-balancing suffix (e.g., ...-3P-1D-24C), filtered by 2P-2D or non-2P-2D."""
     prefix = f"{model_token}-disagg-router-{backend_token}-workload-{workload_key}-"
     candidates = []
-    pattern = re.compile(rf"^{re.escape(prefix)}\d+P-\d+D$")
+    pattern = re.compile(rf"^{re.escape(prefix)}\d+P-\d+D-{concurrency}C$")
     for entry in base_dir.iterdir():
         if entry.is_dir() and pattern.match(entry.name):
             profile = entry / "profile_export_aiperf.json"
-            if profile.is_file():
-                candidates.append(entry)
+            if not profile.is_file():
+                continue
+            prefill, decode = parse_worker_counts(entry.name)
+            if prefill is None or decode is None:
+                continue
+            if require_balanced and (prefill, decode) != (2, 2):
+                continue
+            if not require_balanced and (prefill, decode) == (2, 2):
+                continue
+            candidates.append(entry)
     if not candidates:
+        expectation = "2P-2D" if require_balanced else "non-2P-2D"
         raise FileNotFoundError(
-            f"No disagg directory found for workload {workload_key} with prefix '{prefix}<n>P-<m>D' containing profile_export_aiperf.json."
+            f"No disagg directory found for workload {workload_key} with prefix '{prefix}<n>P-<m>D-{concurrency}C' "
+            f"and worker balance '{expectation}' containing profile_export_aiperf.json."
         )
     if len(candidates) > 1:
         names = ", ".join(e.name for e in candidates)
-        raise ValueError(f"Multiple disagg directories match {prefix}*: {names}.")
+        expectation = "2P-2D" if require_balanced else "non-2P-2D"
+        raise ValueError(f"Multiple disagg directories match {prefix}* with {expectation}: {names}.")
     return candidates[0].name
 
 
 def parse_worker_counts(dir_name: str) -> tuple[int | None, int | None]:
-    """Extract prefill/decode counts from a suffix like -3P-1D; returns (prefill, decode)."""
-    match = re.search(r"-(\d+)P-(\d+)D$", dir_name)
+    """Extract prefill/decode counts from a suffix like -3P-1D or -3P-1D-24C; returns (prefill, decode)."""
+    match = re.search(r"-(\d+)P-(\d+)D(?:-\d+C)?$", dir_name)
     if not match:
         return None, None
     return int(match.group(1)), int(match.group(2))
@@ -128,7 +141,13 @@ def main():
     parser.add_argument(
         "--worker-balancing",
         action="store_true",
-        help="Enable to use disagg folders with explicit prefill/decode worker counts in their names (e.g., ...-3P-1D).",
+        help="Use only 2P-2D disagg folders; when omitted, use only non-2P-2D disagg folders.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=24,
+        help="Concurrency used in the benchmark folder names (e.g., 24C).",
     )
     args = parser.parse_args()
 
@@ -139,24 +158,29 @@ def main():
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    concurrency = args.concurrency
+    if concurrency <= 0:
+        print("Error: --concurrency must be a positive integer.", file=sys.stderr)
+        sys.exit(1)
+
     model_path_token = model_to_path_token(model_name)
     base_dir = Path(__file__).resolve().parent
 
-    if args.worker_balancing:
-        try:
-            disagg_dir_a = find_disagg_dir(base_dir, model_path_token, backend_path_token, "A")
-            disagg_dir_b = find_disagg_dir(base_dir, model_path_token, backend_path_token, "B")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        disagg_dir_a = f"{model_path_token}-disagg-router-{backend_path_token}-workload-A"
-        disagg_dir_b = f"{model_path_token}-disagg-router-{backend_path_token}-workload-B"
+    try:
+        disagg_dir_a = find_disagg_dir(
+            base_dir, model_path_token, backend_path_token, "A", concurrency, require_balanced=args.worker_balancing
+        )
+        disagg_dir_b = find_disagg_dir(
+            base_dir, model_path_token, backend_path_token, "B", concurrency, require_balanced=args.worker_balancing
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     scenarios = [
-        ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A/profile_export_aiperf.json"),
+        ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A-{concurrency}C/profile_export_aiperf.json"),
         ("Disagg + Router", "A", f"{disagg_dir_a}/profile_export_aiperf.json"),
-        ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B/profile_export_aiperf.json"),
+        ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B-{concurrency}C/profile_export_aiperf.json"),
         ("Disagg + Router", "B", f"{disagg_dir_b}/profile_export_aiperf.json"),
     ]
     results = []
@@ -174,7 +198,10 @@ def main():
         workload_to_entries[workload_key].append((label, throughput, ttft_ms, has_errors, full_path))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6.5))
-    fig.suptitle(f"{model_name} on {backend_label} with Dynamo - Throughput & TTFT (Time to First Token)", fontsize=14)
+    fig.suptitle(
+        f"{model_name} on {backend_label} with Dynamo (Concurrency {concurrency}) - Throughput & TTFT (Time to First Token)",
+        fontsize=14,
+    )
 
     throughput_color = "#4C78A8"
     ttft_color = "#F58518"
@@ -246,6 +273,7 @@ def main():
             ttft_range = ttft_max - ttft_min if ttft_max != ttft_min else ttft_max or 1.0
             y_text = ttft_min - 0.08 * ttft_range
             y_text = max(0.05 * ax2_ylim_top, y_text)
+            ttft_delta_color = "#2E6F40" if pct_ttft < 0 else "#B22222"
             ax2.text(
                 (positions[0] + positions[-1]) / 2 if positions else 0.5,
                 y_text,
@@ -254,7 +282,7 @@ def main():
                 va="top",
                 fontsize=10,
                 fontweight="bold",
-                color="#B22222",
+                color=ttft_delta_color,
                 transform=ax2.transData,
             )
 
@@ -271,13 +299,10 @@ def main():
             return "unknown prefill / decode"
         return f"{prefill} prefill / {decode} decode"
 
-    if args.worker_balancing:
-        note3_text = (
-            f"3) Disagg + Router mode uses {fmt_counts(disagg_a_counts)} worker nodes for Workload A; "
-            f"{fmt_counts(disagg_b_counts)} for Workload B. Each worker node requires 1 GPU."
-        )
-    else:
-        note3_text = "3) Disagg + Router mode uses 2 prefill worker nodes and 2 decode worker nodes; each worker node requires 1 GPU."
+    note3_text = (
+        f"3) Disagg + Router mode uses {fmt_counts(disagg_a_counts)} worker nodes for Workload A; "
+        f"{fmt_counts(disagg_b_counts)} for Workload B. Each worker node requires 1 GPU."
+    )
 
     # Add workload explanations below the plots, left-aligned with numbering
     fig.text(0.02, 0.11, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
@@ -289,7 +314,8 @@ def main():
 
     slug_model = slugify(model_name)
     slug_backend = slugify(backend_label)
-    out_path = base_dir / f"output_token_throughput_{slug_model}_{slug_backend}.png"
+    slug_concurrency = f"c{concurrency}"
+    out_path = base_dir / f"output_token_throughput_{slug_model}_{slug_backend}_{slug_concurrency}.png"
     fig.savefig(out_path, dpi=150)
 
     print("Output Token Throughput (tokens/sec) and TTFT (ms)")

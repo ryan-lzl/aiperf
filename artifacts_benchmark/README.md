@@ -29,21 +29,27 @@ Keep port 8000 forwarded to the router frontend that matches the inference backe
 4. Rerun Workload A and Workload B.
 5. Move all the generated folders and files from artifacts to artifacts_benchmark
 6. Compare metrics. Expect clearer gains in Workload B (decode-heavy) and potential wins in Workload A if prefill splitting reduces queuing.
-    ```
-
-    ```
 
 ## Worker balancing flag
-If your disaggregation runs use explicit prefill/decode worker splits in the folder name (e.g., `...-workload-A-3P-1D` meaning 3 prefill workers and 1 decode worker), add `--worker-balancing` so the plotter picks up those directories. Without the flag, it uses the default `...-workload-A`/`...-workload-B` disagg folders (2 prefill + 2 decode).
+Disagg folders now always encode prefill/decode counts and concurrency, e.g., `...-workload-A-3P-1D-24C`.
+- Naming rule: `...-workload-<A|B>-<P>P-<D>D-<C>C`, where `P` is the number of prefill workers, `D` is the number of decode workers, and `C` is the concurrency used for that run.
+- `--worker-balancing` (default **off**) means: only pick 2P-2D disagg folders for each workload.
+- Without the flag: only pick non-2P-2D disagg folders for each workload.
+If zero or multiple folders match for a workload, the script errors so you can disambiguate.
 
 ## Plotting
 Generate the two-panel throughput + TTFT chart (Workload A and B) from the four runs:
 ```
-python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm
-# Add --worker-balancing if using the ...-<n>P-<m>D disagg directories
-python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --worker-balancing
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --concurrency 24
+# Use 2P-2D disagg folders
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --concurrency 24 --worker-balancing
 
-# When using TRT-LLM as the inference backend
-python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm
+# TRT-LLM examples (adjust concurrency to your folders)
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm --concurrency 96
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm --concurrency 96 --worker-balancing
 ```
-This saves `artifacts_benchmark/output_token_throughput_<model>_<backend>.png` and prints a small table of throughput and TTFT (with WARN flags if errors were recorded).
+Pass `--concurrency` to match the `*C` suffix in your folder names. The script expects four folders:
+- Agg: `<model>-agg-<backend>-workload-{A|B}-<C>c`
+- Disagg: `<model>-disagg-router-<backend>-workload-{A|B}-<P>P-<D>D-<C>C` (filtered by the worker-balancing rule above)
+
+Outputs: `artifacts_benchmark/output_token_throughput_<model>_<backend>_c<concurrency>.png` plus a table of throughput and TTFT (with WARN flags if errors were recorded).
