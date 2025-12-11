@@ -1,6 +1,6 @@
 # AIperf Benchmark Playbook
 
-This folder holds the four benchmark runs (aggregation vs disaggregation+router, workloads A and B) for Qwen/Qwen3-0.6B using NVIDIA Dynamo. Runs can target either a vLLM-based router or a TRT-LLM-based router; pick the right port forward before starting disaggregation+router tests (see below).
+This folder holds the four benchmark runs (aggregation vs disaggregation+router, workloads A and B) for Qwen/Qwen3-0.6B using NVIDIA Dynamo. Runs can target a vLLM-, SGLang-, or TRT-LLM-based router; pick the right port forward before starting disaggregation+router tests (see below).
 
 ## Shared flags (use in every run)
 ```
@@ -10,6 +10,7 @@ This folder holds the four benchmark runs (aggregation vs disaggregation+router,
 ## Backend and port forwarding (disaggregation+router)
 Keep port 8000 forwarded to the router frontend that matches the inference backend you are testing:
 - **vLLM backend:** `kubectl port-forward service/llm-disagg-router-frontend-app 8000:8000 -n dynamo-cloud`
+- **SGLang backend:** forward 8000 to your SGLang router frontend service (cluster-specific name).
 - **TRT-LLM backend:** `kubectl port-forward service/trtllm-disagg-router-frontend-app 8000:8000 -n dynamo-cloud`
 
 ## Workloads
@@ -43,6 +44,10 @@ Generate the two-panel throughput + TTFT chart (Workload A and B) from the four 
 python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --concurrency 24
 # Use 2P-2D disagg folders
 python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend vllm --concurrency 24 --worker-balancing
+
+# SGLang examples (24C folders shown)
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend sglang --concurrency 24
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend sglang --concurrency 24 --worker-balancing
 
 # TRT-LLM examples (adjust concurrency to your folders)
 python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm --concurrency 96

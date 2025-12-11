@@ -64,10 +64,12 @@ def normalize_backend_flag(raw: str) -> tuple[str, str]:
         "trt-llm": ("TensorRT-LLM", "trtllm"),
         "trtllm": ("TensorRT-LLM", "trtllm"),
         "tensorrt": ("TensorRT-LLM", "trtllm"),
+        "sglang": ("SGLang", "sglang"),
+        "sg-lang": ("SGLang", "sglang"),
     }
     if key in mapping:
         return mapping[key]
-    raise ValueError(f"Unsupported backend '{raw}'. Expected one of: vllm, trtllm.")
+    raise ValueError(f"Unsupported backend '{raw}'. Expected one of: vllm, trtllm, sglang.")
 
 
 def slugify(text: str) -> str:
