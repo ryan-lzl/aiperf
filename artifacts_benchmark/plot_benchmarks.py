@@ -17,6 +17,32 @@ WORKLOAD_DESCRIPTIONS = {
 }
 
 
+def fmt_counts(counts: tuple[int | None, int | None]) -> str:
+    prefill, decode = counts
+    if prefill is None or decode is None:
+        return "unknown prefill / decode"
+    return f"{prefill} prefill / {decode} decode"
+
+
+def add_footer_notes(fig, disagg_counts: dict[str, tuple[int | None, int | None]]):
+    """Add consistent footer notes for both single-backend and compare plots."""
+    note3_text = (
+        f"3) Disagg + Router mode uses {fmt_counts(disagg_counts.get('A', (None, None)))} worker nodes for Workload A; "
+        f"{fmt_counts(disagg_counts.get('B', (None, None)))} for Workload B. Each worker node requires 1 GPU."
+    )
+    fig.text(0.02, 0.11, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.08, f"2) {WORKLOAD_DESCRIPTIONS['B']}", ha="left", fontsize=9, wrap=True)
+    fig.text(0.02, 0.05, note3_text, ha="left", fontsize=9, wrap=True)
+    fig.text(
+        0.02,
+        0.02,
+        "4) Agg mode uses 4 worker nodes and round-robin for load balancing; each worker node requires 1 GPU.",
+        ha="left",
+        fontsize=9,
+        wrap=True,
+    )
+
+
 def load_throughput(base_dir: Path, rel_path: str):
     path = base_dir / rel_path
     if not path.is_file():
@@ -137,8 +163,12 @@ def main():
     parser.add_argument(
         "--inference-backend",
         dest="inference_backend",
-        required=True,
         help="Inference backend label to annotate in the chart title (e.g., vLLM, TensorRT-LLM).",
+    )
+    parser.add_argument(
+        "--compare-inference-backend",
+        action="store_true",
+        help="Compare vLLM, SGLang, and TensorRT-LLM backends (agg vs disagg+router) for the same model/concurrency.",
     )
     parser.add_argument(
         "--worker-balancing",
@@ -154,12 +184,6 @@ def main():
     args = parser.parse_args()
 
     model_name = args.model
-    try:
-        backend_label, backend_path_token = normalize_backend_flag(args.inference_backend)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
     concurrency = args.concurrency
     if concurrency <= 0:
         print("Error: --concurrency must be a positive integer.", file=sys.stderr)
@@ -167,164 +191,312 @@ def main():
 
     model_path_token = model_to_path_token(model_name)
     base_dir = Path(__file__).resolve().parent
+    compare_mode = args.compare_inference_backend
 
-    try:
-        disagg_dir_a = find_disagg_dir(
-            base_dir, model_path_token, backend_path_token, "A", concurrency, require_balanced=args.worker_balancing
+    if not compare_mode:
+        if not args.inference_backend:
+            print("Error: --inference-backend is required unless --compare-inference-backend is set.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            backend_label, backend_path_token = normalize_backend_flag(args.inference_backend)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            disagg_dir_a = find_disagg_dir(
+                base_dir, model_path_token, backend_path_token, "A", concurrency, require_balanced=args.worker_balancing
+            )
+            disagg_dir_b = find_disagg_dir(
+                base_dir, model_path_token, backend_path_token, "B", concurrency, require_balanced=args.worker_balancing
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        scenarios = [
+            ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A-{concurrency}C/profile_export_aiperf.json"),
+            ("Disagg + Router", "A", f"{disagg_dir_a}/profile_export_aiperf.json"),
+            ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B-{concurrency}C/profile_export_aiperf.json"),
+            ("Disagg + Router", "B", f"{disagg_dir_b}/profile_export_aiperf.json"),
+        ]
+        results = []
+        for label, workload_key, rel_path in scenarios:
+            throughput, ttft_ms, has_errors, full_path = load_throughput(base_dir, rel_path)
+            results.append((label, workload_key, throughput, ttft_ms, has_errors, full_path))
+
+        inferred_backend = infer_backend_label(scenarios[0][2]) if scenarios else "Backend"
+        if backend_label != inferred_backend:
+            print(f"Note: using backend from flag ({backend_label}); inferred backend from paths is {inferred_backend}.")
+
+        # Prepare plot data grouped by workload
+        workload_to_entries = {"A": [], "B": []}
+        for label, workload_key, throughput, ttft_ms, has_errors, full_path in results:
+            workload_to_entries[workload_key].append((label, throughput, ttft_ms, has_errors, full_path))
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6.5))
+        fig.suptitle(
+            f"{model_name} on {backend_label} with Dynamo (Concurrency {concurrency}) - Throughput & TTFT (Time to First Token)",
+            fontsize=14,
         )
-        disagg_dir_b = find_disagg_dir(
-            base_dir, model_path_token, backend_path_token, "B", concurrency, require_balanced=args.worker_balancing
+
+        throughput_color = "#4C78A8"
+        ttft_color = "#F58518"
+
+        def plot_workload(ax, workload_key: str, entries):
+            labels = [e[0] for e in entries]
+            vals = [e[1] for e in entries]
+            ttfts = [e[2] for e in entries]
+            ttft_max = max(ttfts) if ttfts else 0.0
+            ttft_min = min(ttfts) if ttfts else 0.0
+            positions = list(range(len(labels)))
+            ax.plot(positions, vals, color=throughput_color, marker="o", linewidth=2, label="Throughput (tokens/sec)")
+            ax.set_title(f"Workload {workload_key} ({'prefill-heavy' if workload_key=='A' else 'decode-heavy'})")
+            ax.set_ylabel("Output Token Throughput (tokens/sec)", color=throughput_color)
+            ax.tick_params(axis="y", labelcolor=throughput_color)
+            ax.spines["left"].set_edgecolor(throughput_color)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=20, ha="right")
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
+            # Add headroom
+            ymax = max(vals) * 1.25
+            ax.set_ylim(0, ymax)
+            for x, val in zip(positions, vals):
+                ax.text(x, val, f"{val:.1f}", ha="center", va="bottom", fontsize=9, color=throughput_color)
+            # TTFT line on secondary axis
+            ax2 = ax.twinx()
+            ax2.plot(positions, ttfts, color=ttft_color, marker="s", linestyle="-", linewidth=2, label="TTFT (ms)")
+            ax2.set_ylabel("TTFT (ms)", color=ttft_color)
+            ax2_ylim_top = ttft_max * 1.45 if ttft_max else 1.0
+            ax2.set_ylim(0, ax2_ylim_top)
+            ax2.tick_params(axis="y", labelsize=9, colors=ttft_color)
+            ax2.spines["right"].set_edgecolor(ttft_color)
+            # Show TTFT values above markers
+            label_offset = 0.04 * ax2_ylim_top
+            for x, tval in zip(positions, ttfts):
+                ax2.text(x, tval + label_offset, f"{tval:.1f}", ha="center", va="bottom", fontsize=9, color=ttft_color)
+            # Combined legend
+            handles1, labels1 = ax.get_legend_handles_labels()
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(handles1 + handles2, labels1 + labels2, loc="lower left", fontsize=9)
+            # Annotate percentage delta vs agg if applicable
+            base = None
+            alt = None
+            base_ttft = None
+            alt_ttft = None
+            for label, val, tval in zip(labels, vals, ttfts):
+                if "Agg" in label:
+                    base = val
+                    base_ttft = tval
+                if "Disagg" in label:
+                    alt = val
+                    alt_ttft = tval
+            if base and alt:
+                pct = (alt - base) / base * 100.0
+                ax.text(
+                    0.5,
+                    0.9,
+                    f"Throughput Δ vs Agg: {pct:+.1f}%",
+                    ha="center",
+                    va="top",
+                    fontsize=10,
+                    fontweight="bold",
+                    color="#2E6F40" if pct >= 0 else "#B22222",
+                    transform=ax.transAxes,
+                )
+            if base_ttft and alt_ttft:
+                pct_ttft = (alt_ttft - base_ttft) / base_ttft * 100.0
+                # Place TTFT delta under the yellow TTFT line with a small buffer
+                ttft_range = ttft_max - ttft_min if ttft_max != ttft_min else ttft_max or 1.0
+                y_text = ttft_min - 0.08 * ttft_range
+                y_text = max(0.05 * ax2_ylim_top, y_text)
+                ttft_delta_color = "#2E6F40" if pct_ttft < 0 else "#B22222"
+                ax2.text(
+                    (positions[0] + positions[-1]) / 2 if positions else 0.5,
+                    y_text,
+                    f"TTFT Δ vs Agg: {pct_ttft:+.1f}% (lower is better)",
+                    ha="center",
+                    va="top",
+                    fontsize=10,
+                    fontweight="bold",
+                    color=ttft_delta_color,
+                    transform=ax2.transData,
+                )
+
+        plot_workload(axes[0], "A", workload_to_entries["A"])
+        plot_workload(axes[1], "B", workload_to_entries["B"])
+
+        # Build footer notes
+        disagg_a_counts = parse_worker_counts(disagg_dir_a)
+        disagg_b_counts = parse_worker_counts(disagg_dir_b)
+
+        add_footer_notes(fig, {"A": disagg_a_counts, "B": disagg_b_counts})
+
+        fig.tight_layout(rect=(0, 0.18, 1, 0.93))
+
+        slug_model = slugify(model_name)
+        slug_backend = slugify(backend_label)
+        slug_concurrency = f"c{concurrency}"
+        balance_suffix = "_2P_2D" if args.worker_balancing else ""
+        out_path = base_dir / f"output_token_throughput_{slug_model}_{slug_backend}_{slug_concurrency}{balance_suffix}.png"
+        fig.savefig(out_path, dpi=150)
+
+        print("Output Token Throughput (tokens/sec) and TTFT (ms)")
+        print("---------------------------------------------------")
+        for label, workload_key, throughput, ttft_ms, has_errors, full_path in results:
+            warn = "WARN" if has_errors else ""
+            print(f"{label:18s} W{workload_key}  TPS:{throughput:8.2f}  TTFT:{ttft_ms:7.2f} {warn:4s} ({full_path})")
+        print(f"\nSaved chart: {out_path}")
+        return
+
+    # Compare mode: scan all supported backends and plot throughput lines for agg vs disagg + router.
+    supported_backends = [("vLLM", "vllm"), ("SGLang", "sglang"), ("TensorRT-LLM", "trtllm")]
+    results_by_workload = {"A": [], "B": []}  # workload -> list of dicts with backend data
+    printable_rows = []  # for CLI summary
+    backend_counts = {}  # backend -> {"A": (P,D), "B": (P,D)}
+    valid_backend_labels = []
+
+    for backend_label, backend_path_token in supported_backends:
+        try:
+            disagg_dir_a = find_disagg_dir(
+                base_dir, model_path_token, backend_path_token, "A", concurrency, require_balanced=args.worker_balancing
+            )
+            disagg_dir_b = find_disagg_dir(
+                base_dir, model_path_token, backend_path_token, "B", concurrency, require_balanced=args.worker_balancing
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Skipping {backend_label}: {exc}", file=sys.stderr)
+            continue
+
+        scenarios = [
+            ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A-{concurrency}C/profile_export_aiperf.json"),
+            ("Disagg + Router", "A", f"{disagg_dir_a}/profile_export_aiperf.json"),
+            ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B-{concurrency}C/profile_export_aiperf.json"),
+            ("Disagg + Router", "B", f"{disagg_dir_b}/profile_export_aiperf.json"),
+        ]
+
+        per_backend = {"A": {}, "B": {}}
+        try:
+            for label, workload_key, rel_path in scenarios:
+                throughput, ttft_ms, has_errors, full_path = load_throughput(base_dir, rel_path)
+                per_backend[workload_key][label] = (throughput, ttft_ms, has_errors, full_path)
+                printable_rows.append((backend_label, label, workload_key, throughput, ttft_ms, has_errors, full_path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Skipping {backend_label}: {exc}", file=sys.stderr)
+            continue
+
+        if ("Agg" not in per_backend["A"]) or ("Disagg + Router" not in per_backend["A"]) or (
+            "Agg" not in per_backend["B"]
+        ) or ("Disagg + Router" not in per_backend["B"]):
+            print(f"Skipping {backend_label}: missing agg/disagg pairs for both workloads.", file=sys.stderr)
+            continue
+
+        valid_backend_labels.append(backend_label)
+        backend_counts[backend_label] = {
+            "A": parse_worker_counts(disagg_dir_a),
+            "B": parse_worker_counts(disagg_dir_b),
+        }
+
+        # Keep ordering Agg -> Disagg + Router for plotting
+        for wk in ("A", "B"):
+            agg_data = per_backend[wk]["Agg"]
+            disagg_data = per_backend[wk]["Disagg + Router"]
+            results_by_workload[wk].append(
+                {
+                    "backend_label": backend_label,
+                    "throughputs": [agg_data[0], disagg_data[0]],
+                    "ttfts": [agg_data[1], disagg_data[1]],
+                    "has_errors": agg_data[2] or disagg_data[2],
+                }
+            )
+
+    if not valid_backend_labels:
+        print(
+            "Error: No backends had complete agg/disagg results for the requested concurrency and worker-balancing flag.",
+            file=sys.stderr,
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    scenarios = [
-        ("Agg", "A", f"{model_path_token}-agg-{backend_path_token}-workload-A-{concurrency}C/profile_export_aiperf.json"),
-        ("Disagg + Router", "A", f"{disagg_dir_a}/profile_export_aiperf.json"),
-        ("Agg", "B", f"{model_path_token}-agg-{backend_path_token}-workload-B-{concurrency}C/profile_export_aiperf.json"),
-        ("Disagg + Router", "B", f"{disagg_dir_b}/profile_export_aiperf.json"),
-    ]
-    results = []
-    for label, workload_key, rel_path in scenarios:
-        throughput, ttft_ms, has_errors, full_path = load_throughput(base_dir, rel_path)
-        results.append((label, workload_key, throughput, ttft_ms, has_errors, full_path))
-
-    inferred_backend = infer_backend_label(scenarios[0][2]) if scenarios else "Backend"
-    if backend_label != inferred_backend:
-        print(f"Note: using backend from flag ({backend_label}); inferred backend from paths is {inferred_backend}.")
-
-    # Prepare plot data grouped by workload
-    workload_to_entries = {"A": [], "B": []}
-    for label, workload_key, throughput, ttft_ms, has_errors, full_path in results:
-        workload_to_entries[workload_key].append((label, throughput, ttft_ms, has_errors, full_path))
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6.5))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle(
-        f"{model_name} on {backend_label} with Dynamo (Concurrency {concurrency}) - Throughput & TTFT (Time to First Token)",
+        f"{model_name} with Dynamo (Concurrency {concurrency}) - Throughput & TTFT by Backend (Agg vs Disagg + Router)",
         fontsize=14,
     )
 
-    throughput_color = "#4C78A8"
-    ttft_color = "#F58518"
+    colors = plt.get_cmap("tab10")
+    backend_to_color = {label: colors(i) for i, label in enumerate(valid_backend_labels)}
+    x_positions = [0, 1]
+    x_labels = ["Agg", "Disagg + Router"]
 
-    def plot_workload(ax, workload_key: str, entries):
-        labels = [e[0] for e in entries]
-        vals = [e[1] for e in entries]
-        ttfts = [e[2] for e in entries]
-        ttft_max = max(ttfts) if ttfts else 0.0
-        ttft_min = min(ttfts) if ttfts else 0.0
-        positions = list(range(len(labels)))
-        ax.plot(positions, vals, color=throughput_color, marker="o", linewidth=2, label="Throughput (tokens/sec)")
+    throughput_axes = axes[0]
+    ttft_axes = axes[1]
+
+    for idx, workload_key in enumerate(("A", "B")):
+        entries = results_by_workload[workload_key]
+        ax = throughput_axes[idx]
+        for entry in entries:
+            color = backend_to_color.get(entry["backend_label"])
+            ax.plot(
+                x_positions,
+                entry["throughputs"],
+                marker="o",
+                linewidth=2,
+                label=entry["backend_label"],
+                color=color,
+            )
         ax.set_title(f"Workload {workload_key} ({'prefill-heavy' if workload_key=='A' else 'decode-heavy'})")
-        ax.set_ylabel("Output Token Throughput (tokens/sec)", color=throughput_color)
-        ax.tick_params(axis="y", labelcolor=throughput_color)
-        ax.spines["left"].set_edgecolor(throughput_color)
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=20, ha="right")
+        ax.set_ylabel("Output Token Throughput (tokens/sec)")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
-        # Add headroom
-        ymax = max(vals) * 1.25
-        ax.set_ylim(0, ymax)
-        for x, val in zip(positions, vals):
-            ax.text(x, val, f"{val:.1f}", ha="center", va="bottom", fontsize=9, color=throughput_color)
-        # TTFT line on secondary axis
-        ax2 = ax.twinx()
-        ax2.plot(positions, ttfts, color=ttft_color, marker="s", linestyle="-", linewidth=2, label="TTFT (ms)")
-        ax2.set_ylabel("TTFT (ms)", color=ttft_color)
-        ax2_ylim_top = ttft_max * 1.45 if ttft_max else 1.0
-        ax2.set_ylim(0, ax2_ylim_top)
-        ax2.tick_params(axis="y", labelsize=9, colors=ttft_color)
-        ax2.spines["right"].set_edgecolor(ttft_color)
-        # Show TTFT values above markers
-        label_offset = 0.04 * ax2_ylim_top
-        for x, tval in zip(positions, ttfts):
-            ax2.text(x, tval + label_offset, f"{tval:.1f}", ha="center", va="bottom", fontsize=9, color=ttft_color)
-        # Combined legend
-        handles1, labels1 = ax.get_legend_handles_labels()
-        handles2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(handles1 + handles2, labels1 + labels2, loc="lower left", fontsize=9)
-        # Annotate percentage delta vs agg if applicable
-        base = None
-        alt = None
-        base_ttft = None
-        alt_ttft = None
-        for label, val, tval in zip(labels, vals, ttfts):
-            if "Agg" in label:
-                base = val
-                base_ttft = tval
-            if "Disagg" in label:
-                alt = val
-                alt_ttft = tval
-        if base and alt:
-            pct = (alt - base) / base * 100.0
-            ax.text(
-                0.5,
-                0.9,
-                f"Throughput Δ vs Agg: {pct:+.1f}%",
-                ha="center",
-                va="top",
-                fontsize=10,
-                fontweight="bold",
-                color="#2E6F40" if pct >= 0 else "#B22222",
-                transform=ax.transAxes,
+        # Add headroom per workload
+        all_vals = [val for entry in entries for val in entry["throughputs"]]
+        if all_vals:
+            ax.set_ylim(0, max(all_vals) * 1.25)
+
+        ax_ttft = ttft_axes[idx]
+        for entry in entries:
+            color = backend_to_color.get(entry["backend_label"])
+            ax_ttft.plot(
+                x_positions,
+                entry["ttfts"],
+                marker="s",
+                linewidth=2,
+                color=color,
             )
-        if base_ttft and alt_ttft:
-            pct_ttft = (alt_ttft - base_ttft) / base_ttft * 100.0
-            # Place TTFT delta under the yellow TTFT line with a small buffer
-            ttft_range = ttft_max - ttft_min if ttft_max != ttft_min else ttft_max or 1.0
-            y_text = ttft_min - 0.08 * ttft_range
-            y_text = max(0.05 * ax2_ylim_top, y_text)
-            ttft_delta_color = "#2E6F40" if pct_ttft < 0 else "#B22222"
-            ax2.text(
-                (positions[0] + positions[-1]) / 2 if positions else 0.5,
-                y_text,
-                f"TTFT Δ vs Agg: {pct_ttft:+.1f}% (lower is better)",
-                ha="center",
-                va="top",
-                fontsize=10,
-                fontweight="bold",
-                color=ttft_delta_color,
-                transform=ax2.transData,
-            )
+        ax_ttft.set_title(f"Workload {workload_key} TTFT (lower is better)")
+        ax_ttft.set_ylabel("TTFT (ms; lower is better)")
+        ax_ttft.set_xticks(x_positions)
+        ax_ttft.set_xticklabels(x_labels)
+        ax_ttft.grid(axis="y", linestyle="--", alpha=0.4)
+        all_ttfts = [val for entry in entries for val in entry["ttfts"]]
+        if all_ttfts:
+            ax_ttft.set_ylim(0, max(all_ttfts) * 1.35)
+    throughput_axes[0].legend(loc="lower left", fontsize=9)
 
-    plot_workload(axes[0], "A", workload_to_entries["A"])
-    plot_workload(axes[1], "B", workload_to_entries["B"])
+    # Build footer notes using the first valid backend's worker counts to mirror single-backend layout.
+    footer_counts = backend_counts.get(valid_backend_labels[0], {"A": (None, None), "B": (None, None)})
+    add_footer_notes(fig, {"A": footer_counts.get("A", (None, None)), "B": footer_counts.get("B", (None, None))})
 
-    # Build footer notes
-    disagg_a_counts = parse_worker_counts(disagg_dir_a)
-    disagg_b_counts = parse_worker_counts(disagg_dir_b)
-
-    def fmt_counts(counts: tuple[int | None, int | None]) -> str:
-        prefill, decode = counts
-        if prefill is None or decode is None:
-            return "unknown prefill / decode"
-        return f"{prefill} prefill / {decode} decode"
-
-    note3_text = (
-        f"3) Disagg + Router mode uses {fmt_counts(disagg_a_counts)} worker nodes for Workload A; "
-        f"{fmt_counts(disagg_b_counts)} for Workload B. Each worker node requires 1 GPU."
-    )
-
-    # Add workload explanations below the plots, left-aligned with numbering
-    fig.text(0.02, 0.11, f"1) {WORKLOAD_DESCRIPTIONS['A']}", ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.08, f"2) {WORKLOAD_DESCRIPTIONS['B']}", ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.05, note3_text, ha="left", fontsize=9, wrap=True)
-    fig.text(0.02, 0.02, "4) Agg mode uses 4 worker nodes and round-robin for load balancing; each worker node requires 1 GPU.", ha="left", fontsize=9, wrap=True)
-
-    fig.tight_layout(rect=(0, 0.18, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.2, 1, 0.94))
 
     slug_model = slugify(model_name)
-    slug_backend = slugify(backend_label)
     slug_concurrency = f"c{concurrency}"
-    out_path = base_dir / f"output_token_throughput_{slug_model}_{slug_backend}_{slug_concurrency}.png"
+    balance_suffix = "_2P_2D" if args.worker_balancing else ""
+    out_path = base_dir / f"output_token_throughput_{slug_model}_backends_{slug_concurrency}{balance_suffix}_compare.png"
     fig.savefig(out_path, dpi=150)
 
     print("Output Token Throughput (tokens/sec) and TTFT (ms)")
     print("---------------------------------------------------")
-    for label, workload_key, throughput, ttft_ms, has_errors, full_path in results:
-        warn = "WARN" if has_errors else ""
-        print(f"{label:18s} W{workload_key}  TPS:{throughput:8.2f}  TTFT:{ttft_ms:7.2f} {warn:4s} ({full_path})")
+    for backend_label in valid_backend_labels:
+        for row in printable_rows:
+            b_label, label, workload_key, throughput, ttft_ms, has_errors, full_path = row
+            if b_label != backend_label:
+                continue
+            warn = "WARN" if has_errors else ""
+            print(
+                f"{b_label:14s} {label:18s} W{workload_key}  TPS:{throughput:8.2f}  TTFT:{ttft_ms:7.2f} {warn:4s} ({full_path})"
+            )
     print(f"\nSaved chart: {out_path}")
 
 

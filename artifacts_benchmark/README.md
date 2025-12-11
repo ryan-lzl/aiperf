@@ -52,9 +52,16 @@ python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --infere
 # TRT-LLM examples (adjust concurrency to your folders)
 python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm --concurrency 96
 python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --inference-backend trtllm --concurrency 96 --worker-balancing
+
+# Compare all backends (vLLM, SGLang, TRT-LLM) for the same model/concurrency
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --compare-inference-backend --concurrency 24
+python artifacts_benchmark/plot_benchmarks.py --model "Qwen/Qwen3-0.6B" --compare-inference-backend --concurrency 24 --worker-balancing
 ```
 Pass `--concurrency` to match the `*C` suffix in your folder names. The script expects four folders:
 - Agg: `<model>-agg-<backend>-workload-{A|B}-<C>c`
 - Disagg: `<model>-disagg-router-<backend>-workload-{A|B}-<P>P-<D>D-<C>C` (filtered by the worker-balancing rule above)
 
-Outputs: `artifacts_benchmark/output_token_throughput_<model>_<backend>_c<concurrency>.png` plus a table of throughput and TTFT (with WARN flags if errors were recorded).
+Outputs:
+- Single-backend plots: `artifacts_benchmark/output_token_throughput_<model>_<backend>_c<concurrency>.png` (adds `_2P_2D` when `--worker-balancing` is set).
+- Backend comparison plots: `artifacts_benchmark/output_token_throughput_<model>_backends_c<concurrency>[_2P_2D]_compare.png`.
+Each run also prints a table of throughput and TTFT (with WARN flags if errors were recorded).
